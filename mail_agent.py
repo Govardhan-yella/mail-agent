@@ -417,7 +417,7 @@ def summarize(items: Iterable[MailItem], config: Config) -> str:
 
     if not mails:
         return (
-            f"Daily Mail Summary - {today}\n\n"
+            f"📬 Daily Mail Summary - {today}\n\n"
             f"No new emails found in {config.mailbox} for the checked period."
         )
 
@@ -426,33 +426,33 @@ def summarize(items: Iterable[MailItem], config: Config) -> str:
     regular = [mail for mail in mails if not mail.important]
 
     lines = [
-        f"Daily Mail Summary - {today}",
+        f"📬 Daily Mail Summary - {today}",
         "",
-        f"Checked {len(mails)} new email(s) in {config.mailbox}.",
-        f"Important: {len(important)} | Job Alerts: {len(job_alerts)} | Other: {len(regular)}",
+        f"📊 {len(mails)} new | 🔴 {len(important)} important | 💼 {len(job_alerts)} jobs | 📩 {len(regular)} other",
         "",
     ]
 
     if important:
-        lines.append("Important")
-        lines.extend(format_mail_lines(important[:8]))
+        lines.append("🔴 Important")
+        lines.extend(format_mail_lines(important[:8], prefix="🔴"))
         lines.append("")
 
     if job_alerts:
-        lines.append("Job Alerts")
+        lines.append("💼 Job Alerts")
         for mail in job_alerts[:8]:
-            lines.append(f"- {sender_name(mail.sender)}: {mail.subject}")
+            lines.append(f"• {sender_name(mail.sender)}: {mail.subject}")
             if mail.links:
-                lines.append("  Apply: " + " | ".join(mail.links[:3]))
+                lines.append("  🔗 " + " | ".join(mail.links[:3]))
         lines.append("")
 
     if regular:
-        lines.append("Other")
-        lines.extend(format_mail_lines(regular[:12]))
+        lines.append("📩 Other")
+        lines.extend(format_mail_lines(regular[:12], prefix="•"))
+        lines.append("")
 
     hidden_count = len(mails) - min(len(important), 8) - min(len(regular), 12)
     if hidden_count > 0:
-        lines.append(f"\n+ {hidden_count} more email(s) not shown.")
+        lines.append(f"… +{hidden_count} more")
 
     return "\n".join(lines).strip()
 
@@ -499,11 +499,11 @@ def build_mail_context(mails: list[MailItem], limit: int = 25) -> str:
     return "\n".join(lines)
 
 
-def format_mail_lines(items: list[MailItem]) -> list[str]:
+def format_mail_lines(items: list[MailItem], prefix: str = "") -> list[str]:
     lines: list[str] = []
     for index, mail in enumerate(items, start=1):
         snippet = f" - {mail.snippet}" if mail.snippet else ""
-        lines.append(f"{index}. {sender_name(mail.sender)}: {mail.subject}{snippet}")
+        lines.append(f"{prefix}{index}. {sender_name(mail.sender)}: {mail.subject}{snippet}")
     return lines
 
 
@@ -617,6 +617,29 @@ def run_once(config: Config) -> None:
     print(summary)
 
 
+def should_run_today(state: dict, daily_time: str) -> bool:
+    last_run = state.get("last_run")
+    if not last_run:
+        return True
+
+    try:
+        last_run_dt = datetime.fromisoformat(last_run)
+    except ValueError:
+        return True
+
+    now = datetime.now(last_run_dt.tzinfo or None)
+    if last_run_dt.tzinfo is None:
+        last_run_dt = last_run_dt.replace(tzinfo=now.tzinfo)
+
+    today_target = now.replace(
+        hour=int(daily_time.split(":", 1)[0]),
+        minute=int(daily_time.split(":", 1)[1]),
+        second=0,
+        microsecond=0,
+    )
+    return last_run_dt < today_target
+
+
 def seconds_until_daily_time(daily_time: str) -> int:
     try:
         hour_text, minute_text = daily_time.split(":", 1)
@@ -635,14 +658,15 @@ def seconds_until_daily_time(daily_time: str) -> int:
 def run_forever(config: Config) -> None:
     print(f"Mail agent started. Daily summary time: {config.daily_time}")
     while True:
+        if should_run_today(load_state(), config.daily_time):
+            try:
+                run_once(config)
+            except Exception as exc:
+                print(f"Agent failed: {exc}")
+
         wait_seconds = seconds_until_daily_time(config.daily_time)
         print(f"Next check in {wait_seconds // 60} minute(s).")
         time.sleep(wait_seconds)
-
-        try:
-            run_once(config)
-        except Exception as exc:
-            print(f"Agent failed: {exc}")
 
 
 def main() -> None:
