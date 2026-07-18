@@ -257,7 +257,11 @@ def get_text_body(message: Message) -> str:
                 continue
 
             charset = part.get_content_charset() or "utf-8"
-            decoded = payload.decode(charset, errors="replace")
+            try:
+                decoded = payload.decode(charset, errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                continue
+
             if content_type == "text/plain":
                 plain_parts.append(decoded)
             elif content_type == "text/html":
@@ -270,7 +274,11 @@ def get_text_body(message: Message) -> str:
         return ""
 
     charset = message.get_content_charset() or "utf-8"
-    decoded = payload.decode(charset, errors="replace")
+    try:
+        decoded = payload.decode(charset, errors="replace")
+    except (LookupError, UnicodeDecodeError):
+        return ""
+
     if message.get_content_type() == "text/html":
         return strip_html(decoded)
     return decoded
