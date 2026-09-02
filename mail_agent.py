@@ -30,6 +30,8 @@ import ssl
 import subprocess
 import sys
 import time
+import logging
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -43,6 +45,35 @@ from typing import Iterable
 
 STATE_FILE = Path(__file__).with_name(".mail_agent_state.json")
 ENV_FILE = Path(__file__).with_name(".env")
+
+
+def _setup_logger() -> logging.Logger:
+    logger = logging.getLogger("mail_agent")
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+
+    try:
+        log_path = Path.home() / "Library" / "Logs" / "mail-agent.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        pass
+
+    return logger
+
+
+logger = _setup_logger()
 SETUP_HELP = f"""
 Create this file:
 {ENV_FILE}
@@ -97,6 +128,7 @@ class Config:
     use_llm_summary: bool
     llm_model: str
     llm_timeout_seconds: int
+    send_failure_alert: bool
 
 
 @dataclass
@@ -184,6 +216,7 @@ def load_config() -> Config:
         use_llm_summary=get_env("USE_LLM_SUMMARY", "true").lower() == "true",
         llm_model=get_env("LLM_MODEL", "llama3:latest"),
         llm_timeout_seconds=int(get_env("LLM_TIMEOUT_SECONDS", "90")),
+        send_failure_alert=get_env("SEND_FAILURE_ALERT", "false").lower() == "true",
     )
 
 
@@ -400,9 +433,12 @@ def fetch_mail_with_retries(config: Config, state: dict) -> list[MailItem]:
             last_error = exc
             if attempt == attempts:
                 break
-            print(
-                f"Mail fetch failed on attempt {attempt}/{attempts}: {exc}. "
-                f"Retrying in {wait_seconds} seconds..."
+            logger.warning(
+                "Mail fetch failed on attempt %d/%d: %s; retrying in %d seconds...",
+                attempt,
+                attempts,
+                exc,
+                wait_seconds,
             )
             time.sleep(wait_seconds)
 
@@ -416,11 +452,6 @@ def sender_name(sender: str) -> str:
 
 def summarize(items: Iterable[MailItem], config: Config) -> str:
     mails = list(items)
-    if config.use_llm_summary and mails:
-        llm_summary = summarize_with_ollama(mails, config)
-        if llm_summary:
-            return llm_summary
-
     today = datetime.now().strftime("%d %b %Y")
 
     if not mails:
@@ -429,9 +460,24 @@ def summarize(items: Iterable[MailItem], config: Config) -> str:
             f"No new emails found in {config.mailbox} for the checked period."
         )
 
-    important = [mail for mail in mails if mail.important]
-    job_alerts = [mail for mail in mails if is_job_alert(mail)]
-    regular = [mail for mail in mails if not mail.important]
+    # Try LLM classification + summary in one call.
+    if config.use_llm_summary:
+        llm_summary, classification = summarize_and_classify_with_ollama(mails, config)
+        if llm_summary:
+            return llm_summary
+        # LLM ran but returned nothing usable — fall through to template,
+        # but use its classification labels so the template is better sorted.
+        important_idx = set(classification.get("important", []))
+        job_idx = set(classification.get("job_alerts", []))
+        mails_list = list(mails)
+        important = [mails_list[i - 1] for i in important_idx if 1 <= i <= len(mails_list)]
+        job_alerts = [mails_list[i - 1] for i in job_idx if 1 <= i <= len(mails_list)]
+        seen = set(important) | set(job_alerts)
+        regular = [m for m in mails_list if m not in seen]
+    else:
+        important = [mail for mail in mails if mail.important]
+        job_alerts = [mail for mail in mails if is_job_alert(mail)]
+        regular = [mail for mail in mails if not mail.important]
 
     lines = [
         f"📬 Daily Mail Summary - {today}",
@@ -465,18 +511,35 @@ def summarize(items: Iterable[MailItem], config: Config) -> str:
     return "\n".join(lines).strip()
 
 
-def summarize_with_ollama(mails: list[MailItem], config: Config) -> str:
+def summarize_and_classify_with_ollama(
+    mails: list[MailItem], config: Config
+) -> tuple[str, dict[str, list[int]]]:
+    """One Ollama call returns both the summary text and classification.
+
+    Returns (summary_text, {"important": [indices], "job_alerts": [indices]}).
+    Empty summary + empty classification on any failure.
+    """
     context = build_mail_context(mails)
     prompt = (
         "You are a concise personal email assistant.\n"
-        "Create a daily summary in plain text with these sections exactly:\n"
-        "1) Daily Mail Summary - <today date>\n"
-        "2) Stats line: Checked X emails | Important: Y | Job Alerts: Z | Other: W\n"
-        "3) Important\n"
-        "4) Job Alerts\n"
-        "5) Other\n"
+        "First, classify each email (1-based index from the list below):\n"
+        "  - IMPORTANT: urgent, security, payment, account, deadline, action-required\n"
+        "  - JOB ALERT: job posting, application, recruiter, interview, hiring, career opportunity\n"
+        "An email can be both important and a job alert.\n\n"
+        "Then write a daily summary with these sections:\n"
+        "  1) Daily Mail Summary - <today date>\n"
+        "  2) Stats line: Checked X emails | Important: Y | Job Alerts: Z | Other: W\n"
+        "  3) Important\n"
+        "  4) Job Alerts\n"
+        "  5) Other\n"
         "For each section, provide numbered bullets with sender, subject, and one short reason.\n"
         "Do not include markdown code fences.\n\n"
+        "Reply with EXACTLY this JSON (no other text, no markdown fences):\n"
+        "{\n"
+        "  \"important\": [1, 3],\n"
+        "  \"job_alerts\": [2],\n"
+        "  \"summary\": \"the full summary text here...\n"
+        "}\n\n"
         f"Email data:\n{context}\n"
     )
 
@@ -489,20 +552,34 @@ def summarize_with_ollama(mails: list[MailItem], config: Config) -> str:
             timeout=config.llm_timeout_seconds,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
+        return "", {"important": [], "job_alerts": []}
 
     if result.returncode != 0:
-        return ""
+        return "", {"important": [], "job_alerts": []}
 
-    return clean_terminal_output(result.stdout)
+    raw = clean_terminal_output(result.stdout)
+    try:
+        payload = json.loads(raw)
+        summary = payload.get("summary", "")
+        important_idx = payload.get("important", [])
+        job_idx = payload.get("job_alerts", [])
+    except (json.JSONDecodeError, AttributeError):
+        return "", {"important": [], "job_alerts": []}
+
+    return summary, {"important": important_idx, "job_alerts": job_idx}
 
 
 def build_mail_context(mails: list[MailItem], limit: int = 25) -> str:
     lines: list[str] = []
     for index, mail in enumerate(mails[:limit], start=1):
+        date_str = mail.date.strftime("%Y-%m-%d %H:%M") if mail.date else "unknown-date"
+        links_str = ""
+        if mail.links:
+            links_str = " | links=" + ", ".join(mail.links[:5])
         lines.append(
-            f"{index}. sender={sender_name(mail.sender)} | subject={mail.subject} | "
-            f"important={mail.important} | job_alert={is_job_alert(mail)} | snippet={mail.snippet}"
+            f"{index}. date={date_str} | sender={sender_name(mail.sender)} | "
+            f"subject={mail.subject}{links_str}\n"
+            f"   snippet={mail.snippet}"
         )
     return "\n".join(lines)
 
@@ -538,6 +615,41 @@ def split_message(message: str, limit: int = 1500) -> list[str]:
     return chunks
 
 
+def send_with_retry(
+    url: str,
+    data: bytes,
+    headers: dict[str, str],
+    timeout: int = 30,
+    max_attempts: int = 3,
+) -> None:
+    """POST with exponential backoff. Raises on final failure."""
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            request = urllib.request.Request(url, data=data, method="POST")
+            for key, value in headers.items():
+                request.add_header(key, value)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if response.status >= 300:
+                    raise RuntimeError(f"Send failed with HTTP {response.status}")
+            return
+        except (OSError, urllib.error.URLError, RuntimeError) as exc:
+            last_error = exc
+            if attempt == max_attempts:
+                break
+            wait = 2 ** (attempt - 1)
+            logger.warning(
+                "Send attempt %d/%d failed: %s; retrying in %ds",
+                attempt,
+                max_attempts,
+                exc,
+                wait,
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(f"Send failed after {max_attempts} attempts: {last_error}")
+
+
 def send_whatsapp(config: Config, message: str) -> None:
     url = (
         "https://api.twilio.com/2010-04-01/Accounts/"
@@ -545,6 +657,10 @@ def send_whatsapp(config: Config, message: str) -> None:
     )
     credentials = f"{config.twilio_account_sid}:{config.twilio_auth_token}"
     auth_header = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {auth_header}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
 
     for chunk in split_message(message):
         data = urllib.parse.urlencode(
@@ -554,18 +670,13 @@ def send_whatsapp(config: Config, message: str) -> None:
                 "Body": chunk,
             }
         ).encode("utf-8")
-
-        request = urllib.request.Request(url, data=data, method="POST")
-        request.add_header("Authorization", f"Basic {auth_header}")
-        request.add_header("Content-Type", "application/x-www-form-urlencoded")
-
-        with urllib.request.urlopen(request, timeout=30) as response:
-            if response.status >= 300:
-                raise RuntimeError(f"Twilio send failed with HTTP {response.status}")
+        send_with_retry(url, data, headers)
 
 
 def send_telegram(config: Config, message: str) -> None:
     url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
     for chunk in split_message(message, limit=3500):
         data = urllib.parse.urlencode(
             {
@@ -573,11 +684,7 @@ def send_telegram(config: Config, message: str) -> None:
                 "text": chunk,
             }
         ).encode("utf-8")
-        request = urllib.request.Request(url, data=data, method="POST")
-        request.add_header("Content-Type", "application/x-www-form-urlencoded")
-        with urllib.request.urlopen(request, timeout=30) as response:
-            if response.status >= 300:
-                raise RuntimeError(f"Telegram send failed with HTTP {response.status}")
+        send_with_retry(url, data, headers)
 
 
 def send_summary(config: Config, message: str) -> None:
@@ -589,6 +696,31 @@ def send_summary(config: Config, message: str) -> None:
         return
     send_whatsapp(config, message)
     send_telegram(config, message)
+
+
+def send_failure_alert(config: Config, exc: Exception) -> None:
+    """Best-effort failure notice on configured delivery channel(s).
+
+    Never raises — each channel is independently try/except'd so a broken
+    delivery config can't crash the run.
+    """
+    if not config.send_failure_alert:
+        return
+    subject = "Mail agent run failed"
+    body = (
+        f"Mail agent failed at "
+        f"{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M %Z')}:\n{exc}"
+    )
+    try:
+        if config.delivery_channel in ("whatsapp", "both"):
+            send_whatsapp(config, f"{subject}\n\n{body}")
+    except Exception as inner:
+        logger.error("Failure alert via WhatsApp failed: %s", inner)
+    try:
+        if config.delivery_channel in ("telegram", "both"):
+            send_telegram(config, f"{subject}\n\n{body}")
+    except Exception as inner:
+        logger.error("Failure alert via Telegram failed: %s", inner)
 
 
 def is_job_alert(mail: MailItem) -> bool:
@@ -610,8 +742,19 @@ def is_job_alert(mail: MailItem) -> bool:
     return any(keyword in text for keyword in keywords)
 
 
+def _prune_stale_uids(state: dict, config: Config) -> None:
+    """Keep seen_uids capped at 500; safety net for the long tail."""
+    seen = state.get("seen_uids", [])
+    if not seen:
+        return
+    # UIDs are appended newest-first by fetch order, so the last 500 are the
+    # oldest. Keep the newest 500 to stay within the cap and drop older ones.
+    state["seen_uids"] = seen[-500:]
+
+
 def run_once(config: Config) -> None:
     state = load_state()
+    _prune_stale_uids(state, config)
     mails = fetch_mail_with_retries(config, state)
     summary = summarize(mails, config)
     send_summary(config, summary)
@@ -664,16 +807,17 @@ def seconds_until_daily_time(daily_time: str) -> int:
 
 
 def run_forever(config: Config) -> None:
-    print(f"Mail agent started. Daily summary time: {config.daily_time}")
+    logger.info("Mail agent started. Daily summary time: %s", config.daily_time)
     while True:
         if should_run_today(load_state(), config.daily_time):
             try:
                 run_once(config)
             except Exception as exc:
-                print(f"Agent failed: {exc}")
+                logger.error("Agent run failed: %s", exc, exc_info=True)
+                send_failure_alert(config, exc)
 
         wait_seconds = seconds_until_daily_time(config.daily_time)
-        print(f"Next check in {wait_seconds // 60} minute(s).")
+        logger.info("Next check in %d minute(s).", wait_seconds // 60)
         time.sleep(wait_seconds)
 
 
@@ -731,4 +875,5 @@ TELEGRAM_CHAT_ID=123456789
 USE_LLM_SUMMARY=true
 LLM_MODEL=llama3:latest
 LLM_TIMEOUT_SECONDS=90
+SEND_FAILURE_ALERT=false
 """

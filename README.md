@@ -37,14 +37,17 @@ Notes:
 - Logs: `/tmp/mail-agent.out.log` and `/tmp/mail-agent.err.log`.
 - State is stored in `.mail_agent_state.json` and is **not** committed to the repo.
 
-## Commands
-```bash
-# Run one check immediately
-python3 mail_agent.py --once
+## Logging
 
-# Check whether required settings are available
-python3 mail_agent.py --check-config
-```
+Structured logs go to `~/Library/Logs/mail-agent.log` (in addition to
+`/tmp/mail-agent.{out,err}.log` from launchd). Levels: INFO for normal
+operation, WARNING for retries, ERROR for failures with traceback.
+
+## Failure alerts
+
+Set `SEND_FAILURE_ALERT=true` in `.env` to receive a short notice on your
+configured delivery channel when a daily run fails.
+
 
 ## Notes
 - Runtime state is stored in `.mail_agent_state.json` and is not committed to the repository.
