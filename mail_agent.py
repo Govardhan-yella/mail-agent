@@ -131,7 +131,7 @@ class Config:
     send_failure_alert: bool
 
 
-@dataclass
+@dataclass(frozen=True)
 class MailItem:
     uid: str
     sender: str
@@ -522,24 +522,23 @@ def summarize_and_classify_with_ollama(
     context = build_mail_context(mails)
     prompt = (
         "You are a concise personal email assistant.\n"
-        "First, classify each email (1-based index from the list below):\n"
+        "Classify each email below (1-based index from the list):\n"
         "  - IMPORTANT: urgent, security, payment, account, deadline, action-required\n"
         "  - JOB ALERT: job posting, application, recruiter, interview, hiring, career opportunity\n"
-        "An email can be both important and a job alert.\n\n"
-        "Then write a daily summary with these sections:\n"
-        "  1) Daily Mail Summary - <today date>\n"
-        "  2) Stats line: Checked X emails | Important: Y | Job Alerts: Z | Other: W\n"
-        "  3) Important\n"
-        "  4) Job Alerts\n"
-        "  5) Other\n"
-        "For each section, provide numbered bullets with sender, subject, and one short reason.\n"
-        "Do not include markdown code fences.\n\n"
-        "Reply with EXACTLY this JSON (no other text, no markdown fences):\n"
+        "An email can be both important and a job alert.\n"
+        "Then write a daily summary with sections: Important, Job Alerts, Other.\n"
+        "Each section: numbered bullets with sender, subject, one short reason.\n\n"
+        "REQUIRED OUTPUT: a single JSON object and nothing else.\n"
+        "Do NOT write any text before or after the JSON.\n"
+        "Do NOT use markdown code fences.\n\n"
+        "JSON format:\n"
         "{\n"
         "  \"important\": [1, 3],\n"
         "  \"job_alerts\": [2],\n"
-        "  \"summary\": \"the full summary text here...\n"
+        "  \"summary\": \"full summary text here...\n"
         "}\n\n"
+        "The \"summary\" value must contain the FULL summary text including all 3 sections.\n"
+        "The \"important\" and \"job_alerts\" arrays contain the 1-based indices of emails in those categories.\n\n"
         f"Email data:\n{context}\n"
     )
 
@@ -558,13 +557,73 @@ def summarize_and_classify_with_ollama(
         return "", {"important": [], "job_alerts": []}
 
     raw = clean_terminal_output(result.stdout)
-    try:
-        payload = json.loads(raw)
-        summary = payload.get("summary", "")
-        important_idx = payload.get("important", [])
-        job_idx = payload.get("job_alerts", [])
-    except (json.JSONDecodeError, AttributeError):
-        return "", {"important": [], "job_alerts": []}
+    summary, important_idx, job_idx = _parse_llm_output(raw)
+    return summary, {"important": important_idx, "job_alerts": job_idx}
+
+
+def _parse_llm_output(raw: str) -> tuple[str, list[int], list[int]]:
+    """Extract summary + classification from LLM output, however malformed.
+
+    The LLM (llama3:latest) sometimes emits:
+      - text preamble + a JSON object missing the closing brace
+      - the important/job_alerts arrays *outside* the JSON object
+    We pull every field we can from the raw text.
+    """
+    summary = ""
+    important: list[int] = []
+    job_alerts: list[int] = []
+
+    # 1) Try a complete JSON object first.
+    brace_match = re.search(r"\{[\s\S]*?\}", raw)
+    if brace_match:
+        try:
+            obj = json.loads(brace_match.group())
+            if "summary" in obj:
+                summary = obj["summary"] or ""
+            if "important" in obj:
+                important = _as_int_list(obj["important"])
+            if "job_alerts" in obj:
+                job_alerts = _as_int_list(obj["job_alerts"])
+            if summary or important or job_alerts:
+                return summary, important, job_alerts
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    # 2) Extract fields individually from whatever the LLM emitted.
+    sum_match = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    if sum_match:
+        try:
+            summary = json.loads(f'"{sum_match.group(1)}"')
+        except (json.JSONDecodeError, ValueError):
+            summary = sum_match.group(1)
+
+    for key, target in (("important", important), ("job_alerts", job_alerts)):
+        m = re.search(rf'"{key}"\s*:\s*\[[\s\S]*?\]', raw)
+        if m:
+            try:
+                arr = json.loads("{" + m.group() + "}")
+                vals = _as_int_list(arr.get(key, []))
+                if key == "important":
+                    important = vals
+                else:
+                    job_alerts = vals
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    return summary, important, job_alerts
+
+
+def _as_int_list(value) -> list[int]:
+    """Safely coerce a JSON array of numbers into list[int]."""
+    if not isinstance(value, list):
+        return []
+    out: list[int] = []
+    for item in value:
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
 
     return summary, {"important": important_idx, "job_alerts": job_idx}
 
